@@ -1,0 +1,1 @@
+pyinstaller --onedir --clean --noconfirm --collect-data pymavlink main.py

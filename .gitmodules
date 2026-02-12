@@ -1,0 +1,3 @@
+[submodule "third_party/PyArduPilotPlugin"]
+	path = third_party/PyArduPilotPlugin
+	url = https://github.com/TomerTip/PyArduPilotPlugin.git
