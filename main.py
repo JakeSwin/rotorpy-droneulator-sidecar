@@ -1,16 +1,15 @@
 import os
 import asyncio
-import signal
 import json
 import time
 import numpy as np
 from contextlib import asynccontextmanager
 import contextlib
-import torch
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
+# --- Import your simulation dependencies here ---
 from lib.px4_multirotor_edit import PX4Multirotor
 from rotorpy.vehicles.px4_sihsim_quadx_params import quad_params
 from rotorpy.controllers.quadrotor_control import SE3Control
@@ -20,30 +19,103 @@ hover_trajectory = HoverTraj(x0=np.array([0, 0, 5]))
 
 class SimServer:
     def __init__(self):
-        # 1. Initialize as None so we don't block startup
         self.vehicle = None 
         self.controller = SE3Control(quad_params)
 
         self.target_fps = 150.0
         self.dt_target = 1.0 / self.target_fps
-
         self.t_sim = 0.0
-        # Initialize state with defaults until vehicle connects
         self.state = {"x": [0,0,0], "q": [0,0,0,1], "rotor_speeds": [0,0,0,0]} 
 
-        self.clients: set[WebSocket] = set()
+        # --- Connection State ---
+        self.godot_client: WebSocket | None = None
+        self.robotics_clients: set[WebSocket] = set()
+        
         self.command_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._task: asyncio.Task | None = None
 
+    # --- 1. Restored & Adapted Connection Management ---
+    
+    async def disconnect(self, websocket: WebSocket):
+        """Cleanly removes a websocket from whichever set it belongs to."""
+        if websocket == self.godot_client:
+            print("Godot Engine disconnected.", flush=True)
+            self.godot_client = None
+        elif websocket in self.robotics_clients:
+            print("A robotics client disconnected.", flush=True)
+            self.robotics_clients.remove(websocket)
+
+    async def handle_ws(self, websocket: WebSocket):
+        await websocket.accept()
+        
+        # --- Identification Phase ---
+        try:
+            # Wait for the first message to identify the client
+            first_msg = await websocket.receive_text()
+            data = json.loads(first_msg)
+            
+            if data.get("type") == "handshake" and data.get("source") == "godot":
+                print("Godot Engine linked.", flush=True)
+                # If an old connection exists, close it first
+                if self.godot_client is not None:
+                    await self.godot_client.close()
+                self.godot_client = websocket
+            else:
+                print("New robotics client connected.", flush=True)
+                self.robotics_clients.add(websocket)
+                
+                # FIX: Check if the first message has a "type" and isn't just a handshake.
+                # If it's an actionable request (like "request_image"), put it in the queue.
+                if data.get("type") and data.get("type") != "handshake":
+                    await self.command_queue.put(data)
+                    
+        except Exception as e:
+            print(f"Handshake failed: {e}")
+            await websocket.close()
+            return
+
+        # --- Main Loop with Disconnect Handling ---
+        try:
+            while True:
+                # receive() handles both text and binary automatically
+                message = await websocket.receive()
+
+                if "text" in message:
+                    try:
+                        cmd = json.loads(message["text"])
+                        await self.command_queue.put(cmd)
+                    except json.JSONDecodeError:
+                        print("Received invalid JSON", flush=True)
+
+                elif "bytes" in message:
+                    # If Godot sends binary data (image), broadcast to all robotics clients
+                    if websocket == self.godot_client:
+                        # We use a copy of the set to avoid "Set changed size during iteration" errors
+                        # if a client disconnects mid-broadcast
+                        for client in list(self.robotics_clients):
+                            try:
+                                await client.send_bytes(message["bytes"])
+                            except Exception:
+                                # If sending fails, assume disconnect and remove
+                                await self.disconnect(client)
+
+        except WebSocketDisconnect:
+            # This catches the normal "client closed connection" event
+            pass
+        except Exception as e:
+            print(f"Socket error: {e}", flush=True)
+        finally:
+            # This ensures cleanup happens no matter how the loop exits
+            await self.disconnect(websocket)
+
+    # --- 2. Simulation Logic (Unchanged) ---
+
     def _create_vehicle_sync(self):
-        """Blocking call to instantiate PX4Multirotor"""
         print("Attempting to connect to PX4...", flush=True)
         return PX4Multirotor(quad_params, enable_ground=True, initial_state=None)
 
     async def reset_sim(self):
-        """Async reset that offloads the blocking re-instantiation"""
         print("Resetting Simulation...", flush=True)
-        # Use to_thread here so a reset doesn't freeze the websocket/server
         self.vehicle = await asyncio.to_thread(self._create_vehicle_sync)
         self.t_sim = 0.0
         self.state = self.vehicle.initial_state
@@ -57,105 +129,77 @@ class SimServer:
         while True:
             frame_start = time.perf_counter()
 
-            # 2. Connection Phase
             if self.vehicle is None:
                 try:
-                    # Offload the blocking init to a worker thread.
-                    # This allows the MainThread to process SIGINT while waiting.
                     self.vehicle = await asyncio.to_thread(self._create_vehicle_sync)
-                    
-                    # Connection successful
                     self.state = self.vehicle.initial_state
                     print("PX4 Connected!", flush=True)
-                except asyncio.CancelledError:
-                    # Handle shutdown request during connection attempt
-                    raise
-                except Exception as e:
-                    print(f"Connection failed: {e}. Retrying in 1s...", flush=True)
+                except Exception:
                     await asyncio.sleep(1.0)
-                
-                # Skip the physics step if we just connected or failed
                 continue
 
-            # 3. Physics Phase (Only runs if vehicle is connected)
             try:
                 flat = hover_trajectory.update(self.t_sim)
                 control_dict = self.controller.update(self.t_sim, self.state, flat)
                 self.state = self.vehicle.step(self.state, control_dict, self.dt_target)
                 self.t_sim += self.dt_target
             except Exception as e:
-                print(f"Simulation Error: {e}")
-                # Optional: self.vehicle = None (to trigger a reconnect)
+                print(f"Sim Error: {e}")
 
             await self._drain_commands()
             await self.broadcast_state()
 
-            # 4. Timing
-            frame_end = time.perf_counter()
-            dt_actual = frame_end - frame_start
-            sleep_time = self.dt_target - dt_actual
-            
-            # Ensure sleep_time is non-negative
-            await asyncio.sleep(max(0.0, sleep_time))
+            dt_actual = time.perf_counter() - frame_start
+            await asyncio.sleep(max(0.0, self.dt_target - dt_actual))
 
     async def _drain_commands(self):
         while not self.command_queue.empty():
             cmd = await self.command_queue.get()
-            ctype = cmd.get("cmd")
-            if ctype == "restart":
-                await self.reset_sim() # Await the async reset
+            
+            # Standardized on "type"
+            msg_type = cmd.get("type")
+            
+            # Forward image requests to Godot
+            if msg_type == "request_image":
+                if self.godot_client:
+                    await self.godot_client.send_text(json.dumps(cmd))
+            
+            elif msg_type == "restart":
+                await self.reset_sim()
 
     async def broadcast_state(self):
-        if not self.clients or self.vehicle is None:
-            return
-
-        # Ensure state keys exist before accessing
+        if not self.vehicle: return
+        
         try:
-            msg = {
-                "t_sim": self.t_sim,
-                "x": np.asarray(self.state["x"]).tolist(),
-                "q": np.asarray(self.state["q"]).tolist(),
-                "rotor_speeds": np.asarray(self.state["rotor_speeds"]).tolist()
-            }
-            data = json.dumps(msg)
-        except KeyError:
-            return
-
-        disconnected = []
-        for ws in self.clients:
-            try:
-                await ws.send_text(data)
-            except Exception:
-                disconnected.append(ws)
-        for ws in disconnected:
-            self.clients.discard(ws)
-
-    # ... register/unregister/handle_ws remain the same ...
-    async def register(self, websocket: WebSocket):
-        await websocket.accept()
-        self.clients.add(websocket)
-
-    async def unregister(self, websocket: WebSocket):
-        if websocket in self.clients:
-            self.clients.remove(websocket)
-
-    async def handle_ws(self, websocket: WebSocket):
-        await self.register(websocket)
-        try:
-            while True:
-                message = await websocket.receive_text()
+            # Prepare state message
+            msg = json.dumps({
+                "type": "state",
+                "data": {
+                    "t_sim": self.t_sim,
+                    "x": np.asarray(self.state["x"]).tolist(),
+                    "q": np.asarray(self.state["q"]).tolist(),
+                    "rotor_speeds": np.asarray(self.state["rotor_speeds"]).tolist()
+                }
+            })
+            
+            # Send to Godot
+            if self.godot_client:
                 try:
-                    cmd = json.loads(message)
-                    await self.command_queue.put(cmd)
-                except json.JSONDecodeError:
-                    continue
-        except WebSocketDisconnect:
+                    await self.godot_client.send_text(msg)
+                except Exception:
+                    await self.disconnect(self.godot_client)
+            
+            # Send to Robotics Clients
+            for ws in list(self.robotics_clients):
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    await self.disconnect(ws)
+                    
+        except Exception:
             pass
-        finally:
-            await self.unregister(websocket)
 
 # --- App Setup ---
-
 sim_server: SimServer | None = None
 
 @asynccontextmanager
@@ -166,32 +210,15 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        print("Shutting down sim server...", flush=True)
-        # 1. Cancel the asyncio task
-        if sim_server._task:
-            sim_server._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                # Wait briefly for it to clean up, but don't wait forever
-                try:
-                    await asyncio.wait_for(sim_server._task, timeout=2.0)
-                except asyncio.TimeoutError:
-                    print("Sim task did not cancel gracefully (thread stuck?)", flush=True)
-
-        print("Forcing process exit...", flush=True)
-        # 2. Hard exit to kill any stuck background threads (like the PX4 connection)
+        if sim_server._task: sim_server._task.cancel()
         os._exit(0)
 
 app = FastAPI(lifespan=lifespan)
 
-# Add your routes back here
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     if sim_server:
         await sim_server.handle_ws(websocket)
 
-config = uvicorn.Config(app, host="0.0.0.0", port=8000, reload=False)
-server = uvicorn.Server(config)
-
 if __name__ == "__main__":
-    print("Starting python sidecar...", flush=True)
-    asyncio.run(server.serve())
+    asyncio.run(uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000)).serve())

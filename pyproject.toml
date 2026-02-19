@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi[standard]>=0.128.1",
+    "opencv-python>=4.13.0.92",
     "pyinstaller>=6.18.0",
     "rotorpy[px4]>=2.1.0",
     "uvicorn>=0.40.0",
