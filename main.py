@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import contextlib
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from scipy.spatial.transform import Rotation as R
 import uvicorn
 
 # --- Import your simulation dependencies here ---
@@ -16,6 +17,17 @@ from rotorpy.controllers.quadrotor_control import SE3Control
 from rotorpy.trajectories.hover_traj import HoverTraj
 
 hover_trajectory = HoverTraj(x0=np.array([0, 0, 5]))
+initial_rotation = R.from_euler('z', 90, degrees=True)
+initial_quat = initial_rotation.as_quat()
+
+initial_state = {
+    'x': np.zeros(3),
+    'v': np.zeros(3),
+    'q': initial_quat, # Apply an initial rotation of 90deg so facing north to fit px4
+    'w': np.zeros(3),
+    'wind': np.zeros(3),
+    'rotor_speeds': np.zeros(quad_params['num_rotors'])
+}
 
 class SimServer:
     def __init__(self):
@@ -112,7 +124,7 @@ class SimServer:
 
     def _create_vehicle_sync(self):
         print("Attempting to connect to PX4...", flush=True)
-        return PX4Multirotor(quad_params, enable_ground=True, initial_state=None)
+        return PX4Multirotor(quad_params, enable_ground=True, initial_state=initial_state)
 
     async def reset_sim(self):
         print("Resetting Simulation...", flush=True)
@@ -177,7 +189,9 @@ class SimServer:
                 "data": {
                     "t_sim": self.t_sim,
                     "x": np.asarray(self.state["x"]).tolist(),
+                    "v": np.asarray(self.state["v"]).tolist(),
                     "q": np.asarray(self.state["q"]).tolist(),
+                    "w": np.asarray(self.state["w"]).tolist(),
                     "rotor_speeds": np.asarray(self.state["rotor_speeds"]).tolist()
                 }
             })
